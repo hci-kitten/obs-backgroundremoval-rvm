@@ -6,6 +6,8 @@
 #ifndef ORT_SESSION_UTILS_H
 #define ORT_SESSION_UTILS_H
 
+#include <string>
+
 #include <opencv2/core/types.hpp>
 
 #include "../FilterData.hpp"
@@ -16,7 +18,7 @@
 #define OBS_BGREMOVAL_ORT_SESSION_ERROR_STARTUP 5
 #define OBS_BGREMOVAL_ORT_SESSION_SUCCESS 0
 
-int createOrtSession(filter_data *tf);
+int createOrtSession(filter_data *tf, const std::string &resolvedModelPath = {});
 
 bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat &output);
 

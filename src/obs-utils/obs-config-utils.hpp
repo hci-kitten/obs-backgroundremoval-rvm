@@ -6,6 +6,8 @@
 #ifndef OBS_CONFIG_UTILS_H
 #define OBS_CONFIG_UTILS_H
 
+#include <string>
+
 enum {
 	OBS_BGREMOVAL_CONFIG_SUCCESS = 0,
 	OBS_BGREMOVAL_CONFIG_FAIL = 1,
@@ -31,5 +33,11 @@ int getFlagFromConfig(const char *name, bool *returnValue, bool defaultValue);
  * OBS_BGREMOVAL_CONFIG_FAIL otherwise.
  */
 int setFlagInConfig(const char *name, const bool value);
+
+/**
+ * Resolve a writable cache file path under the plugin's OBS config directory,
+ * ensuring its parent directory exists.
+ */
+std::string getModelCachePath(const std::string &relativeModelPath);
 
 #endif /* OBS_CONFIG_UTILS_H */

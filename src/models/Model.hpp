@@ -260,6 +260,14 @@ public:
 
 	virtual void assignOutputToInput(std::vector<std::vector<float>> &, std::vector<std::vector<float>> &) {}
 
+	virtual bool isBCHW() const { return false; }
+
+	virtual bool hasRecurrentStates() const { return false; }
+
+	virtual float recurrentDownsampleRatio() const { return 1.0f; }
+
+	virtual void resetRecurrentStates(std::vector<std::vector<float>> &) {}
+
 	virtual void runNetworkInference(const std::unique_ptr<Ort::Session> &session,
 					 const std::vector<Ort::AllocatedStringPtr> &inputNames,
 					 const std::vector<Ort::AllocatedStringPtr> &outputNames,
@@ -292,14 +300,19 @@ public:
 	ModelBCHW(/* args */) {}
 	~ModelBCHW() {}
 
-	virtual void prepareInputToNetwork(cv::Mat &resizedImage, cv::Mat &preprocessedImage)
+	virtual bool isBCHW() const override { return true; }
+
+	virtual void prepareInputToNetwork(cv::Mat &resizedImage, cv::Mat &preprocessedImage) override
 	{
 		resizedImage = resizedImage / 255.0;
 		hwc_to_chw(resizedImage, preprocessedImage);
 	}
 
-	virtual void postprocessOutput(cv::Mat &output)
+	virtual void postprocessOutput(cv::Mat &output) override
 	{
+		if (output.channels() <= 1) {
+			return;
+		}
 		cv::Mat outputTransposed;
 		chw_to_hwc_32f(output, outputTransposed);
 		outputTransposed.copyTo(output);

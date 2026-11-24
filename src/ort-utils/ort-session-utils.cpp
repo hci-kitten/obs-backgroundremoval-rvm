@@ -19,10 +19,11 @@
 #include <obs-module.h>
 
 #include "ort-session-utils.hpp"
+#include "model-downloader.hpp"
 #include "../consts.h"
 #include "../plugin-support.h"
 
-int createOrtSession(filter_data *tf)
+int createOrtSession(filter_data *tf, const std::string &resolvedModelPath)
 {
 	if (tf->model.get() == nullptr) {
 		obs_log(LOG_ERROR, "Model object is not initialized");
@@ -40,24 +41,21 @@ int createOrtSession(filter_data *tf)
 		sessionOptions.SetIntraOpNumThreads(tf->numThreads);
 	}
 
-	char *modelFilepath_rawPtr = obs_module_file(tf->modelSelection.c_str());
-
-	if (modelFilepath_rawPtr == nullptr) {
-		obs_log(LOG_ERROR, "Unable to get model filename %s from plugin.", tf->modelSelection.c_str());
-		return OBS_BGREMOVAL_ORT_SESSION_ERROR_FILE_NOT_FOUND;
+	std::string modelFilepath_s = resolvedModelPath;
+	if (modelFilepath_s.empty()) {
+		if (!ensureModelAvailable(tf->modelSelection, modelFilepath_s)) {
+			obs_log(LOG_ERROR, "Unable to locate or download model %s.", tf->modelSelection.c_str());
+			return OBS_BGREMOVAL_ORT_SESSION_ERROR_FILE_NOT_FOUND;
+		}
 	}
 
-	std::string modelFilepath_s(modelFilepath_rawPtr);
-
 #if _WIN32
-	int outLength = MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, modelFilepath_rawPtr, -1, nullptr, 0);
+	int outLength = MultiByteToWideChar(CP_UTF8, 0, modelFilepath_s.c_str(), -1, nullptr, 0);
 	tf->modelFilepath = std::wstring(outLength, L'\0');
-	MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, modelFilepath_rawPtr, -1, tf->modelFilepath.data(), outLength);
+	MultiByteToWideChar(CP_UTF8, 0, modelFilepath_s.c_str(), -1, tf->modelFilepath.data(), outLength);
 #else
-	tf->modelFilepath = std::string(modelFilepath_rawPtr);
+	tf->modelFilepath = modelFilepath_s;
 #endif
-
-	bfree(modelFilepath_rawPtr);
 
 	try {
 #ifdef HAVE_ONNXRUNTIME_CUDA_EP

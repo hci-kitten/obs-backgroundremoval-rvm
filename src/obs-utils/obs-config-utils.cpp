@@ -69,3 +69,24 @@ int setFlagInConfig(const char *name, const bool value)
 
 	return OBS_BGREMOVAL_CONFIG_SUCCESS;
 }
+
+std::string getModelCachePath(const std::string &relativeModelPath)
+{
+	create_config_folder();
+
+	char *rawPath = obs_module_config_path(relativeModelPath.c_str());
+	if (!rawPath) {
+		obs_log(LOG_ERROR, "Failed to resolve config cache path for %s", relativeModelPath.c_str());
+		return {};
+	}
+
+	std::string fullPath(rawPath);
+	bfree(rawPath);
+
+	const std::filesystem::path parentDir = std::filesystem::path(fullPath).parent_path();
+	if (!parentDir.empty()) {
+		os_mkdirs(parentDir.string().c_str());
+	}
+
+	return fullPath;
+}

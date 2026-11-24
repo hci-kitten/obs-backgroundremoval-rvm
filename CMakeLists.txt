@@ -198,6 +198,7 @@ target_link_libraries(
     OBS::libobs
     OBS::obs-frontend-api
     onnxruntime::onnxruntime
+    CURL::libcurl
     CurlClient
     OpenCV::opencv_core
     OpenCV::opencv_imgproc
@@ -209,6 +210,7 @@ target_sources(
   PRIVATE
     src/plugin-main.c
     src/plugin-support.c
+    src/ort-utils/model-downloader.cpp
     src/ort-utils/ort-session-utils.cpp
     src/obs-utils/obs-utils.cpp
     src/obs-utils/obs-config-utils.cpp

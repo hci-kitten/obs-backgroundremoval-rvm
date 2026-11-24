@@ -204,6 +204,7 @@ obs_properties_t *background_filter_properties(void *data)
 	obs_property_list_add_string(p_model_select, obs_module_text("Selfie Multiclass"), MODEL_SELFIE_MULTICLASS);
 	obs_property_list_add_string(p_model_select, obs_module_text("PPHumanSeg"), MODEL_PPHUMANSEG);
 	obs_property_list_add_string(p_model_select, obs_module_text("Robust Video Matting"), MODEL_RVM);
+	obs_property_list_add_string(p_model_select, "Robust Video Matting HQ (ResNet50, 720p)", MODEL_RVM_RESNET);
 	obs_property_list_add_string(p_model_select, obs_module_text("TCMonoDepth"), MODEL_DEPTH_TCMONODEPTH);
 
 	obs_properties_add_float_slider(props, "temporal_smooth_factor", obs_module_text("TemporalSmoothFactor"), 0.0,
@@ -340,6 +341,9 @@ void background_filter_update(void *data, obs_data_t *settings)
 		}
 		if (tf->modelSelection == MODEL_RVM) {
 			tf->model.reset(new ModelRVM);
+		}
+		if (tf->modelSelection == MODEL_RVM_RESNET) {
+			tf->model.reset(new ModelRVM(true));
 		}
 		if (tf->modelSelection == MODEL_PPHUMANSEG) {
 			tf->model.reset(new ModelPPHumanSeg);
