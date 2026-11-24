@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2021-2026 Roy Shilkrot <roy.shil@gmail.com>
 // SPDX-FileCopyrightText: 2023-2026 Kaito Udagawa <umireon@kaito.tokyo>
+// SPDX-FileCopyrightText: 2026 hci-kitten
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -13,7 +14,7 @@
 #include "../plugin-support.h"
 
 static const std::string GITHUB_LATEST_RELEASE_URL =
-	"https://api.github.com/repos/royshil/obs-backgroundremoval/releases/latest";
+	"https://api.github.com/repos/hci-kitten/obs-backgroundremoval-rvm/releases/latest";
 
 void github_utils_get_release_information(std::function<void(github_utils_release_information)> callback)
 {
@@ -32,6 +33,11 @@ void github_utils_get_release_information(std::function<void(github_utils_releas
 		std::string version = obs_data_get_string(data, "tag_name");
 		std::string body = obs_data_get_string(data, "body");
 		obs_data_release(data);
+
+		if (version.empty()) {
+			callback({OBS_BGREMOVAL_GITHUB_UTILS_ERROR, "", ""});
+			return;
+		}
 
 		// remove the "v" prefix in version, if it exists
 		if (version[0] == 'v') {

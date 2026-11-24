@@ -1,133 +1,47 @@
-# OBS Plugin: Portrait Background Removal / Virtual Green-screen and Low-Light Enhancement
+# obs-backgroundremoval-rvm
 
-<div align="center">
+An independent, Linux-focused fork of [`royshil/obs-backgroundremoval`](https://github.com/royshil/obs-backgroundremoval) (`v1.4.1`, `GPL-3.0-or-later`) focused on real-time 60 fps **Robust Video Matting (RVM) ResNet50** portrait matting in OBS Studio.
 
-[![GitHub](https://img.shields.io/github/license/royshil/obs-backgroundremoval)](https://github.com/royshil/obs-backgroundremoval/blob/main/LICENSE)
-[![GitHub Workflow Status](https://github.com/royshil/obs-backgroundremoval/actions/workflows/push.yaml/badge.svg)](https://github.com/royshil/obs-backgroundremoval/actions/workflows/push.yaml)
-[![Total downloads](https://img.shields.io/github/downloads/royshil/obs-backgroundremoval/total)](https://github.com/royshil/obs-backgroundremoval/releases)
-![Flathub](https://img.shields.io/flathub/downloads/com.obsproject.Studio.Plugin.BackgroundRemoval?label=Flathub%20Installs)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/royshil/obs-backgroundremoval)](https://github.com/royshil/obs-backgroundremoval/releases)
+> **Why this fork exists:** Upstream `royshil/obs-backgroundremoval` `v1.5+` transitioned to a shader-only MediaPipe pipeline and removed ONNX Runtime, OpenCV, and RVM model support. This fork builds on `v1.4.1` to keep full-precision (`fp32`) ONNX Runtime RVM ResNet50 matting alive on Linux with asynchronous inference and zero-copy NVIDIA CUDA–OpenGL acceleration.
 
-</div>
+> **Platform support (v1):** Linux only (x86_64 and arm64). Windows and macOS are unsupported in v1.
 
-A plugin for [OBS Studio](https://obsproject.com/) that allows you to replace the background in portrait images and video, as well as enhance low-light scenes.
+## Highlights
 
-<p align="center">
-  <a href="https://royshil.github.io/obs-backgroundremoval/">
-    <b>⬇️ Download & Install OBS Background Removal ⬇️</b>
-  </a>
-</p>
+- **RVM ResNet50 HQ (720p, full `fp32` precision):** Runs `rvm_resnet50_fp32.onnx` at `1280×768` (`downsample_ratio = 0.25`) with properly sized ResNet50 recurrent states (`16/32/64/128`).
+- **On-demand SHA-256 verified model download:** `rvm_resnet50_fp32.onnx` (`107,479,165` bytes, `GPL-3.0`) is not bundled in git. When selected for the first time, it downloads asynchronously in the background without blocking OBS's UI or render thread, verifies SHA-256 (`25db300fcb6ee27f941a1b52c97856e8d1f13c7f35817f81a612f89af0e8a85c`), and caches under OBS's writable plugin config directory (`models/rvm_resnet50_fp32.onnx`). Set `OBS_BGREMOVAL_RVM_HQ_URL` (must be `https://`) to use a custom mirror.
+- **Non-blocking latest-frame worker thread:** Moves ONNX Runtime inference off OBS's 60 Hz tick/render thread onto a dedicated 3-slot latest-frame-wins worker while preserving strict sequential RVM recurrent state updates.
+- **Zero-copy CUDA–OpenGL + `fp32` `Ort::IoBinding`:** On Linux systems with an NVIDIA driver (`libcuda.so.1`, loaded dynamically via `dlopen`) and CUDA-enabled `libonnxruntime`, camera frames, RVM recurrent states (`r1..r4`), and alpha masks stay resident on the GPU via OpenGL interop and PTX pre/post-processing.
+- **Graceful fallback everywhere:** Automatically degrades cleanly to CPU execution (or pre-downscaled staging + `Ort::IoBinding`) when no NVIDIA GPU, `libcuda.so.1`, CUDA Execution Provider, or OpenGL interop is available. ORT-format (`.ort`) models stay on CPU automatically.
 
-Or, browse versions on [releases page](https://github.com/royshil/obs-backgroundremoval/releases).
+## Recommended Settings for RVM HQ
 
-> Not working? Please try [the Lite version (Live Background Removal Lite)](https://github.com/kaito-tokyo/live-backgroundremoval-lite) developed by one of us (Kaito Udagawa).
+1. Select **Robust Video Matting HQ (ResNet50, 720p)** under **Segmentation Model**.
+2. Select **GPU (CUDA)** under **Inference Device** if you have an NVIDIA GPU and CUDA-enabled ONNX Runtime (otherwise **CPU** works out-of-the-box).
+3. **Disable `Enable Threshold`** and set **`Temporal Smooth Factor` to `0.0`** — RVM HQ produces clean soft alpha mattes with built-in recurrent temporal stability; extra thresholding or EMA smoothing adds unnecessary latency and edge artifacts.
 
-## Usage
+## Building from Source (Linux)
 
-<div style="text-align:center;">
-<video src="https://github.com/royshil/obs-backgroundremoval/assets/1067855/5ba5aae2-7ea2-4c90-ad45-fba5ccde1a4e" width="320"></video>
-</div>
-
-Check out the [usage guide page](https://royshil.github.io/obs-backgroundremoval/usage/) for usage walkthrough and recommendations.
-
-Additional tutorial videos:
-
-- [▶︎ Official guide to the Background Removal plugin for OBS Studio on YouTube](https://www.youtube.com/playlist?list=PLfd4SnaQQz_DVr_18OQozucYmiC56rRhy)
-- Depth of Field effect: https://youtu.be/jC3EKSpNjQk
-- Low-light enhancement: https://youtu.be/WSBLYWFrn2Q
-- Remove background from ANY object (not just human): https://youtu.be/N74VCDCToX8
-
-## How to build from source
-
-**Windows**:
-
-```pwsh
-git clone https://github.com/royshil/obs-backgroundremoval.git
+```bash
+git clone https://github.com/hci-kitten/obs-backgroundremoval-rvm.git
+cd obs-backgroundremoval-rvm
+cmake --preset linux
+cmake --build --preset linux
 ```
 
-**Platforms we support building from source officially:**
+- Requires OBS Studio headers (`libobs-dev`), `libcurl`, `OpenCV`, and `ONNX Runtime` (`>= 1.17`, `1.29` tested with CUDA EP).
+- `ENABLE_CUDA_EP` defaults to `ON` on Linux and uses the ONNX Runtime C++ `OrtApi` table with runtime CPU fallback, so CPU-only `libonnxruntime-dev` builds (such as Debian CI) compile and run without extra CUDA build dependencies.
 
-```
-git clone https://github.com/royshil/obs-backgroundremoval.git
-cd obs-backgroundremoval
-sudo ./bin/bootstrap
-./bin/setup
-./bin/build
-sudo dpkg -i release/obs-backgroundremoval-*-linux-gnu.deb
-```
+## Credits and Licenses
 
-The supported platforms are:
-
-- Debian Forky (x86_64 and arm64)
-
-We plan to add building scripts for popular platforms such as Windows, Mac, and various distributions of Linux.
-
-## Introduction
-
-This plugin is meant to make it easy to replace the background in portrait images and video.
-It is using a neural network to predict the mask of the portrait and remove the background pixels.
-It's easily composable with other OBS plugins to replace the background with e.g. an image or
-a transparent color.
-
-If you like this work, which is given to you completely free of charge, please consider supporting it by sponsoring us on GitHub:
-
-- https://github.com/sponsors/royshil
-- https://github.com/sponsors/umireon
-
-### Support and Help
-
-Reach out to us on [GitHub Discussions](https://github.com/royshil/obs-backgroundremoval/discussions) or the [OBS Plugins forum](https://obsproject.com/forum/resources/background-removal-portrait-segmentation.1260/) for online / immediate help.
-
-If you found a bug or want to suggest a feature or improvement please open an [issue](https://github.com/royshil/obs-backgroundremoval/issues).
-
-If you are looking for hands-on help or private consultation please select a [sponsorship tier](https://github.com/sponsors/royshil?frequency=one-time).
-
-### Technical Details
-
-GPU support:
-
-- On Windows, we plan to support WinML acceleration.
-- On Mac we support CoreML for acceleration, which is efficient on Apple Silicon. **Note:** This plugin does not support cross-architecture translation (Rosetta2). Intel binaries on Apple Silicon or Apple Silicon binaries on Intel will crash.
-- On Linux CUDA, ROCM (deprecated in ONNX Runtime 1.23.0), and MIGraphX are supported if this plugin is built from source. Ensure your ONNX Runtime installation has CUDA, ROCM, or MIGraphX support. For AMD GPUs, MIGraphX is recommended as ROCM was removed from ONNX Runtime starting with version 1.23.0.
-- The goal of this plugin is to be available for everyone on every system, even if they don't own a GPU.
-
-Number of CPU threads is controllable through the UI settings. A 2-thread setting works best.
-
-The pretrained model weights used for portrait foreground segmentation are taken from:
-
-- https://github.com/anilsathyan7/Portrait-Segmentation/tree/master/SINet
-- https://github.com/PaddlePaddle/PaddleSeg/tree/release/2.7/contrib/PP-HumanSeg
-- https://github.com/PINTO0309/PINTO_model_zoo/tree/main/082_MediaPipe_Meet_Segmentation
-- https://github.com/PeterL1n/RobustVideoMatting
-- https://github.com/PINTO0309/PINTO_model_zoo/tree/main/384_TCMonoDepth and https://github.com/yu-li/TCMonoDepth
-
-Image enhancement (low light) models are taken from:
-
-- https://github.com/PINTO0309/PINTO_model_zoo/tree/main/213_TBEFN
-- https://github.com/PINTO0309/PINTO_model_zoo/tree/main/372_URetinex-Net
-- https://github.com/PINTO0309/PINTO_model_zoo/tree/main/370_Semantic-Guided-Low-Light-Image-Enhancement
-
-Some more information about how I built it: https://www.morethantechnical.com/2021/04/15/obs-plugin-for-portrait-background-removal-with-onnx-sinet-model/ and https://www.morethantechnical.com/2023/05/20/building-an-obs-background-removal-plugin-a-walkthrough/
-
-### Code Walkthrough
-
-This video on YouTube will take you through the major parts of the code and explain them.
-
-<div align="center">
-  <a href="https://youtu.be/iFQtcJg0Wsk" target="_blank">
-    <img width="50%" src="https://img.youtube.com/vi/iFQtcJg0Wsk/maxresdefault.jpg"/>
-  </a>
-</div>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=royshil/obs-backgroundremoval&type=Date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=royshil/obs-backgroundremoval&type=Date" />
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=royshil/obs-backgroundremoval&type=Date" />
-</picture>
+- **Plugin (`GPL-3.0-or-later`):** Forked from [`royshil/obs-backgroundremoval`](https://github.com/royshil/obs-backgroundremoval) `v1.4.1` by **Roy Shilkrot**, **Kaito Udagawa**, and the `obs-backgroundremoval` contributors. See [`LICENSE`](LICENSE).
+- **RVM ResNet50 model (`GPL-3.0`):** `rvm_resnet50_fp32.onnx` is created and published by **Peter Lin et al.** in [`PeterL1n/RobustVideoMatting`](https://github.com/PeterL1n/RobustVideoMatting) (`v1.0.0`, `GPL-3.0`).
+- Other bundled `.ort` model weights retain their original attributions and `.license` files under `data/models/`.
 
 ---
 
 > SPDX-FileCopyrightText: 2021-2026 Roy Shilkrot <roy.shil@gmail.com>  
 > SPDX-FileCopyrightText: 2023-2026 Kaito Udagawa <umireon@kaito.tokyo>  
+> SPDX-FileCopyrightText: 2026 hci-kitten  
 >
 > SPDX-License-Identifier: GPL-3.0-or-later  
