@@ -207,6 +207,7 @@ target_link_libraries(
     OpenCV::opencv_core
     OpenCV::opencv_imgproc
     $<$<TARGET_EXISTS:OpenCV::opencv_geometry>:OpenCV::opencv_geometry>
+    ${CMAKE_DL_LIBS}
 )
 
 target_sources(
@@ -216,6 +217,7 @@ target_sources(
     src/plugin-support.c
     src/ort-utils/model-downloader.cpp
     src/ort-utils/ort-session-utils.cpp
+    src/ort-utils/cuda-gpu-pipeline.cpp
     src/obs-utils/obs-utils.cpp
     src/obs-utils/obs-config-utils.cpp
     src/update-checker/github-utils.cpp

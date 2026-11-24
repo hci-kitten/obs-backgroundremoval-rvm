@@ -45,13 +45,12 @@
 #include "FilterData.hpp"
 #include "ort-utils/model-downloader.hpp"
 #include "ort-utils/ort-session-utils.hpp"
+#include "ort-utils/cuda-gpu-pipeline.hpp"
 #include "obs-utils/obs-utils.hpp"
 #include "consts.h"
 #include "update-checker/update-checker.h"
 
 namespace {
-
-constexpr int kInputSlotCount = 3;
 
 struct FilterParamsSnapshot {
 	bool enableThreshold = true;
@@ -66,6 +65,7 @@ struct FilterParamsSnapshot {
 };
 
 struct FrameSlotMeta {
+	bool isGpuSlot = false;
 	bool isBgra = false;
 	uint32_t sourceW = 0;
 	uint32_t sourceH = 0;
@@ -102,21 +102,30 @@ struct background_removal_filter : public filter_data, public std::enable_shared
 	gs_effect_t *effect = nullptr;
 	gs_effect_t *kawaseBlurEffect = nullptr;
 
-	// Dedicated GPU downscale render target (GS_RGBA at network input size) & stage surface
+	// Dedicated GPU downscale render target (GS_RGBA at network input size) & fallback stage surface
 	gs_texrender_t *inferTexrender = nullptr;
 	gs_stagesurf_t *inferStagesurface = nullptr;
+	std::vector<gs_texrender_t *> pinnedInferTexrenders;
 
 	// Persistent output mask texture (reused across frames; updated only when maskGeneration advances)
 	gs_texture_t *alphaTexture = nullptr;
+	std::vector<gs_texture_t *> pinnedAlphaTextures;
 	uint32_t alphaTexW = 0;
 	uint32_t alphaTexH = 0;
+	bool alphaTexDynamic = false;
 	uint64_t uploadedMaskGen = 0;
 
 	// Published mask state (guarded by outputLock)
 	uint64_t publishedMaskGen = 0;
+	bool publishedMaskIsGpu = false;
 	uint32_t publishedMaskW = 0;
 	uint32_t publishedMaskH = 0;
 
+	// CUDA fp32 GPU-resident pipeline (GL interop + PTX pre/post + ORT IoBinding ping-pong r1..r4)
+	CudaGpuPipeline cudaPipeline;
+	std::atomic<bool> cudaGpuReady{false};
+	std::atomic<bool> forceHostMaskUpload{false};
+	bool loggedGlR8Fallback = false;
 	std::atomic<uint32_t> netInputW{0};
 	std::atomic<uint32_t> netInputH{0};
 
@@ -130,8 +139,8 @@ struct background_removal_filter : public filter_data, public std::enable_shared
 	int busySlot = -1;
 	uint64_t droppedByLatest = 0;
 	FilterParamsSnapshot paramsSnapshot;
-	std::array<FrameSlotMeta, kInputSlotCount> slotMeta{};
-	std::array<cv::Mat, kInputSlotCount> cpuInputSlots{};
+	std::array<FrameSlotMeta, CudaGpuPipeline::kInputSlotCount> slotMeta{};
+	std::array<cv::Mat, CudaGpuPipeline::kInputSlotCount> cpuInputSlots{};
 
 	// Asynchronous first-use model download state (guarded by workerMutex; modelLoadInFlight/sessionReady atomic)
 	bool pendingModelLoad = false;
@@ -344,6 +353,67 @@ void background_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "blur_focus_depth", 0.1);
 }
 
+static void destroyAlphaTextureOnGraphicsThread(background_removal_filter *tf)
+{
+	if (tf->alphaTexture) {
+		gs_texture_destroy(tf->alphaTexture);
+		tf->alphaTexture = nullptr;
+	}
+	tf->alphaTexW = 0;
+	tf->alphaTexH = 0;
+	tf->alphaTexDynamic = false;
+	tf->uploadedMaskGen = 0;
+}
+
+static void releaseAlphaGlAndDestroyOnGraphicsThread(background_removal_filter *tf)
+{
+	const bool alphaReleased = tf->cudaPipeline.releaseGlAlphaResourceOnGraphicsThread();
+	if (alphaReleased) {
+		for (gs_texture_t *pinned : tf->pinnedAlphaTextures) {
+			if (pinned) {
+				gs_texture_destroy(pinned);
+			}
+		}
+		tf->pinnedAlphaTextures.clear();
+		destroyAlphaTextureOnGraphicsThread(tf);
+	} else {
+		// Retain GL texture alive while CUDA ownership is unresolved (unless it was purely GS_DYNAMIC).
+		if (tf->alphaTexture) {
+			if (tf->alphaTexDynamic) {
+				gs_texture_destroy(tf->alphaTexture);
+			} else {
+				tf->pinnedAlphaTextures.push_back(tf->alphaTexture);
+			}
+			tf->alphaTexture = nullptr;
+		}
+		tf->alphaTexW = 0;
+		tf->alphaTexH = 0;
+		tf->alphaTexDynamic = false;
+		tf->uploadedMaskGen = 0;
+	}
+}
+
+static void releaseInputGlAndDestroyOnGraphicsThread(background_removal_filter *tf, bool destroyActiveInferTexrender)
+{
+	const bool inputReleased = tf->cudaPipeline.releaseGlInputResourceOnGraphicsThread();
+	if (inputReleased) {
+		for (gs_texrender_t *pinned : tf->pinnedInferTexrenders) {
+			if (pinned) {
+				gs_texrender_destroy(pinned);
+			}
+		}
+		tf->pinnedInferTexrenders.clear();
+		if (destroyActiveInferTexrender && tf->inferTexrender) {
+			gs_texrender_destroy(tf->inferTexrender);
+			tf->inferTexrender = nullptr;
+		}
+	} else if (tf->inferTexrender) {
+		// Quarantine active inferTexrender while CUDA still holds its GL texture; allocate fresh if staying live.
+		tf->pinnedInferTexrenders.push_back(tf->inferTexrender);
+		tf->inferTexrender = destroyActiveInferTexrender ? nullptr : gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	}
+}
+
 static bool initializeSessionFromPathLocked(background_removal_filter *tf, const std::string &resolvedPath)
 {
 	const int ortSessionResult = createOrtSession(tf, resolvedPath);
@@ -361,15 +431,27 @@ static bool initializeSessionFromPathLocked(background_removal_filter *tf, const
 	tf->model->getNetworkInputSize(tf->inputDims, inW, inH);
 	tf->netInputW.store(inW, std::memory_order_release);
 	tf->netInputH.store(inH, std::memory_order_release);
-	tf->sessionReady.store(true, std::memory_order_release);
+
+	// Initialize fp32 CUDA GPU pipeline when CUDA EP is active on single-channel alpha BCHW models (RVM HQ).
+	const bool singleChanOut = !tf->outputDims.empty() && tf->outputDims[0].size() == 4 &&
+				   tf->outputDims[0][1] == 1 && static_cast<uint32_t>(tf->outputDims[0][2]) == inH &&
+				   static_cast<uint32_t>(tf->outputDims[0][3]) == inW;
+	if (tf->cudaSessionActive && tf->model->isBCHW() && singleChanOut) {
+		if (tf->cudaPipeline.initialize(inW, inH, tf->model->hasRecurrentStates(),
+						tf->model->recurrentDownsampleRatio(), tf->inputDims, tf->outputDims)) {
+			tf->cudaGpuReady.store(true, std::memory_order_release);
+		}
+	}
 
 	{
 		std::lock_guard<std::mutex> outLock(tf->outputLock);
 		tf->backgroundMask.release();
 		tf->publishedMaskGen = 0;
+		tf->publishedMaskIsGpu = false;
 		tf->publishedMaskW = 0;
 		tf->publishedMaskH = 0;
 	}
+	tf->sessionReady.store(true, std::memory_order_release);
 	return true;
 }
 
@@ -435,7 +517,7 @@ void background_filter_update(void *data, obs_data_t *settings)
 	}
 
 	// Full model/session/shader initialization:
-	// Cancel any in-flight model download immediately via modelEpoch before taking locks.
+	// 1. Cancel any in-flight model download via modelEpoch, fence video_render, then release GL interop handles.
 	uint64_t newEpoch = tf->modelEpoch.load(std::memory_order_acquire);
 	if (needModelReload) {
 		newEpoch = tf->modelEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -443,13 +525,8 @@ void background_filter_update(void *data, obs_data_t *settings)
 	tf->isDisabled.store(true, std::memory_order_seq_cst);
 
 	obs_enter_graphics();
-	if (tf->alphaTexture) {
-		gs_texture_destroy(tf->alphaTexture);
-		tf->alphaTexture = nullptr;
-		tf->alphaTexW = 0;
-		tf->alphaTexH = 0;
-		tf->uploadedMaskGen = 0;
-	}
+	releaseInputGlAndDestroyOnGraphicsThread(tf.get(), false);
+	releaseAlphaGlAndDestroyOnGraphicsThread(tf.get());
 
 	char *effect_path = obs_module_file(EFFECT_PATH);
 	gs_effect_destroy(tf->effect);
@@ -486,6 +563,10 @@ void background_filter_update(void *data, obs_data_t *settings)
 		std::unique_lock<std::mutex> lock(tf->modelMutex);
 
 		tf->sessionReady.store(false, std::memory_order_release);
+		tf->cudaGpuReady.store(false, std::memory_order_relaxed);
+		tf->forceHostMaskUpload.store(false, std::memory_order_relaxed);
+		tf->loggedGlR8Fallback = false;
+		tf->cudaPipeline.shutdown();
 		tf->session.reset();
 		tf->netInputW.store(0, std::memory_order_release);
 		tf->netInputH.store(0, std::memory_order_release);
@@ -528,6 +609,7 @@ void background_filter_update(void *data, obs_data_t *settings)
 			std::lock_guard<std::mutex> outLock(tf->outputLock);
 			tf->backgroundMask.release();
 			tf->publishedMaskGen = 0;
+			tf->publishedMaskIsGpu = false;
 			tf->publishedMaskW = 0;
 			tf->publishedMaskH = 0;
 		}
@@ -583,8 +665,8 @@ void background_filter_update(void *data, obs_data_t *settings)
 	obs_log(LOG_INFO, "Background Removal Filter Options:");
 	obs_log(LOG_INFO, "  Source: %s", obs_source_get_name(tf->source));
 	obs_log(LOG_INFO, "  Model: %s", tf->modelSelection.c_str());
-	obs_log(LOG_INFO, "  Inference Device: %s (cudaSession=%s)", tf->useGPU.c_str(),
-		tf->cudaSessionActive ? "true" : "false");
+	obs_log(LOG_INFO, "  Inference Device: %s (cudaSession=%s, gpuPipeline=%s)", tf->useGPU.c_str(),
+		tf->cudaSessionActive ? "true" : "false", tf->cudaGpuReady.load() ? "true" : "false");
 	obs_log(LOG_INFO, "  Num Threads: %u", tf->numThreads);
 	obs_log(LOG_INFO, "  Enable Threshold: %s", tf->enableThreshold ? "true" : "false");
 	obs_log(LOG_INFO, "  Threshold: %f", tf->threshold);
@@ -684,7 +766,7 @@ void background_filter_destroy(void *data)
 			tf->isDisabled.store(true, std::memory_order_seq_cst);
 			tf->modelEpoch.fetch_add(1, std::memory_order_acq_rel);
 
-			// Stop and join worker thread BEFORE touching graphics context or ORT state.
+			// Stop and join worker thread BEFORE touching graphics context or ORT/CUDA state.
 			{
 				std::lock_guard<std::mutex> wlock(tf->workerMutex);
 				tf->stopWorker.store(true, std::memory_order_release);
@@ -697,14 +779,8 @@ void background_filter_destroy(void *data)
 			}
 
 			obs_enter_graphics();
-			if (tf->inferTexrender) {
-				gs_texrender_destroy(tf->inferTexrender);
-				tf->inferTexrender = nullptr;
-			}
-			if (tf->alphaTexture) {
-				gs_texture_destroy(tf->alphaTexture);
-				tf->alphaTexture = nullptr;
-			}
+			releaseInputGlAndDestroyOnGraphicsThread(tf, true);
+			releaseAlphaGlAndDestroyOnGraphicsThread(tf);
 			if (tf->inferStagesurface) {
 				gs_stagesurface_destroy(tf->inferStagesurface);
 				tf->inferStagesurface = nullptr;
@@ -720,6 +796,8 @@ void background_filter_destroy(void *data)
 			gs_effect_destroy(tf->kawaseBlurEffect);
 			tf->kawaseBlurEffect = nullptr;
 			obs_leave_graphics();
+
+			tf->cudaPipeline.shutdown();
 		}
 		delete ptr;
 	}
@@ -732,25 +810,11 @@ static void processImageForBackground(background_removal_filter *tf, const cv::M
 	if (!runFilterModelInference(tf, imageInput, outputImage, inputIsRGBA)) {
 		return;
 	}
-
-	if (tf->modelSelection == MODEL_SELFIE_MULTICLASS) {
-		std::vector<cv::Mat> outputImageSplit;
-		cv::split(outputImage, outputImageSplit);
-		cv::Mat background, hair, body, face, clothes;
-		background = outputImageSplit[0];
-		hair = outputImageSplit[1];
-		body = outputImageSplit[2];
-		face = outputImageSplit[3];
-		clothes = outputImageSplit[4];
-		outputImage = cv::min(cv::max(cv::max(hair, body), cv::max(face, clothes)), 255 - background);
-	}
-
-	backgroundMask = 255 - outputImage;
-
 	if (params.enableThreshold) {
-		if (params.threshold < 1.0f) {
-			backgroundMask = backgroundMask > static_cast<int>(params.threshold * 255.0f);
-		}
+		const uint8_t threshold_value = static_cast<uint8_t>(std::clamp(params.threshold * 255.0f, 0.0f, 255.0f));
+		backgroundMask = outputImage < threshold_value;
+	} else {
+		backgroundMask = 255 - outputImage;
 	}
 }
 
@@ -801,6 +865,8 @@ static void applyThresholdMorphology(cv::Mat &backgroundMask, const FilterParams
 
 static void background_removal_worker(background_removal_filter *tf)
 {
+	cv::Mat hostMaskScratch;
+
 	while (true) {
 		bool doModelLoad = false;
 		uint64_t loadEpoch = 0;
@@ -840,6 +906,18 @@ static void background_removal_worker(background_removal_filter *tf)
 				       tf->modelEpoch.load(std::memory_order_acquire) != loadEpoch;
 			};
 
+			auto resetFailedLoad = [tf, loadEpoch]() {
+				std::unique_lock<std::mutex> mlock(tf->modelMutex);
+				if (tf->modelEpoch.load(std::memory_order_acquire) == loadEpoch) {
+					tf->sessionReady.store(false, std::memory_order_release);
+					tf->cudaGpuReady.store(false, std::memory_order_relaxed);
+					tf->cudaPipeline.shutdown();
+					tf->session.reset();
+					tf->netInputW.store(0, std::memory_order_release);
+					tf->netInputH.store(0, std::memory_order_release);
+				}
+			};
+
 			try {
 				std::string resolvedPath;
 				const bool available = ensureModelAvailable(loadModel, resolvedPath, shouldCancel);
@@ -848,9 +926,10 @@ static void background_removal_worker(background_removal_filter *tf)
 					if (!shouldCancel() && tf->model) {
 						if (initializeSessionFromPathLocked(tf, resolvedPath)) {
 							obs_log(LOG_INFO,
-								"Background Removal model ready: %s (cudaSession=%s)",
+								"Background Removal model ready: %s (cudaSession=%s, gpuPipeline=%s)",
 								loadModel.c_str(),
-								tf->cudaSessionActive ? "true" : "false");
+								tf->cudaSessionActive ? "true" : "false",
+								tf->cudaGpuReady.load() ? "true" : "false");
 						}
 					}
 				} else if (!shouldCancel()) {
@@ -861,31 +940,13 @@ static void background_removal_worker(background_removal_filter *tf)
 			} catch (const Ort::Exception &e) {
 				obs_log(LOG_ERROR, "ONNXRuntime exception while loading model %s: %s",
 					loadModel.c_str(), e.what());
-				std::unique_lock<std::mutex> mlock(tf->modelMutex);
-				if (tf->modelEpoch.load(std::memory_order_acquire) == loadEpoch) {
-					tf->sessionReady.store(false, std::memory_order_release);
-					tf->session.reset();
-					tf->netInputW.store(0, std::memory_order_release);
-					tf->netInputH.store(0, std::memory_order_release);
-				}
+				resetFailedLoad();
 			} catch (const std::exception &e) {
 				obs_log(LOG_ERROR, "Exception while loading model %s: %s", loadModel.c_str(), e.what());
-				std::unique_lock<std::mutex> mlock(tf->modelMutex);
-				if (tf->modelEpoch.load(std::memory_order_acquire) == loadEpoch) {
-					tf->sessionReady.store(false, std::memory_order_release);
-					tf->session.reset();
-					tf->netInputW.store(0, std::memory_order_release);
-					tf->netInputH.store(0, std::memory_order_release);
-				}
+				resetFailedLoad();
 			} catch (...) {
 				obs_log(LOG_ERROR, "Unknown exception while loading model %s", loadModel.c_str());
-				std::unique_lock<std::mutex> mlock(tf->modelMutex);
-				if (tf->modelEpoch.load(std::memory_order_acquire) == loadEpoch) {
-					tf->sessionReady.store(false, std::memory_order_release);
-					tf->session.reset();
-					tf->netInputW.store(0, std::memory_order_release);
-					tf->netInputH.store(0, std::memory_order_release);
-				}
+				resetFailedLoad();
 			}
 
 			{
@@ -906,71 +967,182 @@ static void background_removal_worker(background_removal_filter *tf)
 			    !tf->isDisabled.load(std::memory_order_acquire) && tf->model && tf->session &&
 			    meta.epoch == tf->modelEpoch.load(std::memory_order_acquire)) {
 				if (tf->resetRecurrentPending.exchange(false, std::memory_order_acq_rel)) {
+					tf->cudaPipeline.resetRecurrentAndTemporalState();
 					tf->model->resetRecurrentStates(tf->inputTensorValues);
 					tf->lastBackgroundMask.release();
 					tf->lastImageBGRA.release();
 				}
 
-				const cv::Mat &imageInput = tf->cpuInputSlots[static_cast<size_t>(slot)];
-				bool skipBySimilarity = false;
-				if (params.enableImageSimilarity && !tf->lastImageBGRA.empty() && !imageInput.empty() &&
-				    tf->lastImageBGRA.size() == imageInput.size()) {
-					if (cv::PSNR(tf->lastImageBGRA, imageInput) > params.imageSimilarityThreshold) {
-						skipBySimilarity = true;
-					}
-				}
-				if (!skipBySimilarity && !imageInput.empty()) {
-					if (params.enableImageSimilarity) {
-						imageInput.copyTo(tf->lastImageBGRA);
-					}
-					cv::Mat mask;
-					processImageForBackground(tf, imageInput, !meta.isBgra, params, mask);
-					if (!mask.empty()) {
-						if (params.temporalSmoothFactor > 0.0f &&
-						    params.temporalSmoothFactor < 1.0f &&
-						    !tf->lastBackgroundMask.empty() &&
-						    tf->lastBackgroundMask.size() == mask.size()) {
-							float effSmooth = params.temporalSmoothFactor;
-							if (params.enableThreshold) {
-								effSmooth = std::max(effSmooth, params.threshold);
+				const bool needCpuMorphology =
+					params.enableThreshold &&
+					(params.contourFilter > 0.0f || params.smoothContour > 0.0f ||
+					 params.maskExpansion != 0 || params.feather > 0.0f);
+
+				if (tf->cudaGpuReady.load(std::memory_order_acquire) &&
+				    tf->cudaPipeline.isInitialized()) {
+					bool skipBySimilarity = false;
+					if (!meta.isGpuSlot) {
+						const cv::Mat &cpuFrame = tf->cpuInputSlots[static_cast<size_t>(slot)];
+						if (params.enableImageSimilarity && !tf->lastImageBGRA.empty() &&
+						    !cpuFrame.empty() && tf->lastImageBGRA.size() == cpuFrame.size()) {
+							if (cv::PSNR(tf->lastImageBGRA, cpuFrame) >
+							    params.imageSimilarityThreshold) {
+								skipBySimilarity = true;
 							}
-							cv::addWeighted(mask, effSmooth, tf->lastBackgroundMask,
-									1.0f - effSmooth, 0.0, mask);
 						}
-						mask.copyTo(tf->lastBackgroundMask);
+						if (!skipBySimilarity && params.enableImageSimilarity &&
+						    !cpuFrame.empty()) {
+							cpuFrame.copyTo(tf->lastImageBGRA);
+						}
+						if (!skipBySimilarity) {
+							if (!tf->cudaPipeline.uploadHostFrameToSlot(
+								    cpuFrame.data,
+								    static_cast<uint32_t>(cpuFrame.step[0]), slot,
+								    meta.isBgra)) {
+								skipBySimilarity = true;
+							}
+						}
+					}
 
-						if (params.enableThreshold) {
-							applyThresholdMorphology(mask, params, meta.sourceW,
-										 meta.sourceH);
+					if (!skipBySimilarity) {
+						const bool needHostMask =
+							needCpuMorphology || tf->cudaPipeline.isGlInteropDisabled() ||
+							tf->forceHostMaskUpload.load(std::memory_order_relaxed);
+						if (needHostMask) {
+							hostMaskScratch.create(static_cast<int>(meta.netH),
+									       static_cast<int>(meta.netW), CV_8UC1);
 						}
 
-						{
-							std::lock_guard<std::mutex> outLock(tf->outputLock);
-							mask.copyTo(tf->backgroundMask);
-							tf->publishedMaskW =
-								static_cast<uint32_t>(tf->backgroundMask.cols);
-							tf->publishedMaskH =
-								static_cast<uint32_t>(tf->backgroundMask.rows);
-							tf->publishedMaskGen++;
-						}
+						const bool ok = tf->cudaPipeline.runInferenceOnSlot(
+							*tf->session, tf->inputNames, tf->outputNames, slot,
+							params.enableThreshold, params.threshold,
+							params.temporalSmoothFactor,
+							needHostMask ? hostMaskScratch.data : nullptr);
 
-						const double elapsedMs = std::chrono::duration<double, std::milli>(
-										 std::chrono::steady_clock::now() - t0)
-										 .count();
-						tf->statsFrames++;
-						tf->statsAccumMs += elapsedMs;
-						if (!tf->loggedFirstFramePath) {
-							tf->loggedFirstFramePath = true;
-							obs_log(LOG_INFO,
-								"First frame completed: path=staged-downscaled+cpu infer_ms=%.2f net=%ux%u",
-								elapsedMs, meta.netW, meta.netH);
-						} else if (tf->statsFrames % 300 == 0) {
-							obs_log(LOG_INFO,
-								"Worker stats: path=staged-downscaled+cpu avg_infer_ms=%.2f frames=%llu dropped_by_latest=%llu",
-								tf->statsAccumMs / 300.0,
-								static_cast<unsigned long long>(tf->statsFrames),
-								static_cast<unsigned long long>(droppedSnapshot));
-							tf->statsAccumMs = 0.0;
+						if (ok) {
+							const char *activePath =
+								meta.isGpuSlot
+									? (needHostMask ? "cuda-gl-input+host-mask"
+											: "cuda-gl-zero-copy")
+									: "staged-downscaled+cuda-iobinding";
+
+							if (needCpuMorphology) {
+								cv::Mat morphMask = hostMaskScratch.clone();
+								applyThresholdMorphology(morphMask, params,
+											 meta.sourceW, meta.sourceH);
+								std::lock_guard<std::mutex> outLock(tf->outputLock);
+								morphMask.copyTo(tf->backgroundMask);
+								tf->publishedMaskIsGpu = false;
+								tf->publishedMaskW =
+									static_cast<uint32_t>(tf->backgroundMask.cols);
+								tf->publishedMaskH =
+									static_cast<uint32_t>(tf->backgroundMask.rows);
+								tf->publishedMaskGen++;
+							} else if (needHostMask) {
+								std::lock_guard<std::mutex> outLock(tf->outputLock);
+								hostMaskScratch.copyTo(tf->backgroundMask);
+								tf->publishedMaskIsGpu = false;
+								tf->publishedMaskW = meta.netW;
+								tf->publishedMaskH = meta.netH;
+								tf->publishedMaskGen++;
+							} else {
+								std::lock_guard<std::mutex> outLock(tf->outputLock);
+								if (tf->cudaPipeline.publishScratchMask()) {
+									tf->publishedMaskIsGpu = true;
+									tf->publishedMaskW = meta.netW;
+									tf->publishedMaskH = meta.netH;
+									tf->publishedMaskGen++;
+								}
+							}
+
+							const double elapsedMs =
+								std::chrono::duration<double, std::milli>(
+									std::chrono::steady_clock::now() - t0)
+									.count();
+							tf->statsFrames++;
+							tf->statsAccumMs += elapsedMs;
+							if (!tf->loggedFirstFramePath) {
+								tf->loggedFirstFramePath = true;
+								obs_log(LOG_INFO,
+									"First frame completed: path=%s infer_ms=%.2f net=%ux%u",
+									activePath, elapsedMs, meta.netW, meta.netH);
+							} else if (tf->statsFrames % 300 == 0) {
+								obs_log(LOG_INFO,
+									"Worker stats: path=%s avg_infer_ms=%.2f frames=%llu dropped_by_latest=%llu",
+									activePath, tf->statsAccumMs / 300.0,
+									static_cast<unsigned long long>(tf->statsFrames),
+									static_cast<unsigned long long>(droppedSnapshot));
+								tf->statsAccumMs = 0.0;
+							}
+						}
+					}
+				} else {
+					// CPU / .ort fallback path on worker thread (explicitly propagates RGBA vs BGRA format)
+					const cv::Mat &imageInput = tf->cpuInputSlots[static_cast<size_t>(slot)];
+					bool skipBySimilarity = false;
+					if (params.enableImageSimilarity && !tf->lastImageBGRA.empty() &&
+					    !imageInput.empty() && tf->lastImageBGRA.size() == imageInput.size()) {
+						if (cv::PSNR(tf->lastImageBGRA, imageInput) >
+						    params.imageSimilarityThreshold) {
+							skipBySimilarity = true;
+						}
+					}
+					if (!skipBySimilarity && !imageInput.empty()) {
+						if (params.enableImageSimilarity) {
+							imageInput.copyTo(tf->lastImageBGRA);
+						}
+						cv::Mat mask;
+						processImageForBackground(tf, imageInput, !meta.isBgra, params, mask);
+						if (!mask.empty()) {
+							if (params.temporalSmoothFactor > 0.0f &&
+							    params.temporalSmoothFactor < 1.0f &&
+							    !tf->lastBackgroundMask.empty() &&
+							    tf->lastBackgroundMask.size() == mask.size()) {
+								float effSmooth = params.temporalSmoothFactor;
+								if (params.enableThreshold) {
+									effSmooth =
+										std::max(effSmooth, params.threshold);
+								}
+								cv::addWeighted(mask, effSmooth, tf->lastBackgroundMask,
+										1.0f - effSmooth, 0.0, mask);
+							}
+							mask.copyTo(tf->lastBackgroundMask);
+
+							if (params.enableThreshold) {
+								applyThresholdMorphology(mask, params, meta.sourceW,
+											 meta.sourceH);
+							}
+
+							{
+								std::lock_guard<std::mutex> outLock(tf->outputLock);
+								mask.copyTo(tf->backgroundMask);
+								tf->publishedMaskIsGpu = false;
+								tf->publishedMaskW =
+									static_cast<uint32_t>(tf->backgroundMask.cols);
+								tf->publishedMaskH =
+									static_cast<uint32_t>(tf->backgroundMask.rows);
+								tf->publishedMaskGen++;
+							}
+
+							const double elapsedMs =
+								std::chrono::duration<double, std::milli>(
+									std::chrono::steady_clock::now() - t0)
+									.count();
+							tf->statsFrames++;
+							tf->statsAccumMs += elapsedMs;
+							if (!tf->loggedFirstFramePath) {
+								tf->loggedFirstFramePath = true;
+								obs_log(LOG_INFO,
+									"First frame completed: path=staged-downscaled+cpu infer_ms=%.2f net=%ux%u",
+									elapsedMs, meta.netW, meta.netH);
+							} else if (tf->statsFrames % 300 == 0) {
+								obs_log(LOG_INFO,
+									"Worker stats: path=staged-downscaled+cpu avg_infer_ms=%.2f frames=%llu dropped_by_latest=%llu",
+									tf->statsAccumMs / 300.0,
+									static_cast<unsigned long long>(tf->statsFrames),
+									static_cast<unsigned long long>(droppedSnapshot));
+								tf->statsAccumMs = 0.0;
+							}
 						}
 					}
 				}
@@ -1036,8 +1208,7 @@ static void captureAndEnqueueLatestFrame(background_removal_filter *tf, obs_sour
 	if (tf->inferTexrender) {
 		gs_texture_t *prevTex = gs_texrender_get_texture(tf->inferTexrender);
 		if (prevTex && (gs_texture_get_width(prevTex) != netW || gs_texture_get_height(prevTex) != netH)) {
-			gs_texrender_destroy(tf->inferTexrender);
-			tf->inferTexrender = nullptr;
+			releaseInputGlAndDestroyOnGraphicsThread(tf, true);
 		}
 	}
 	if (!tf->inferTexrender) {
@@ -1054,11 +1225,12 @@ static void captureAndEnqueueLatestFrame(background_removal_filter *tf, obs_sour
 		return;
 	}
 
+	// Claim the 1 guaranteed free slot out of 3 (neither busySlot nor latestSlot).
 	int writeSlot = -1;
 	uint64_t currentEpoch = 0;
 	{
 		std::lock_guard<std::mutex> wlock(tf->workerMutex);
-		for (int s = 0; s < kInputSlotCount; s++) {
+		for (int s = 0; s < CudaGpuPipeline::kInputSlotCount; s++) {
 			if (s != tf->busySlot && s != tf->latestSlot && s != tf->renderSlot) {
 				writeSlot = s;
 				break;
@@ -1071,38 +1243,58 @@ static void captureAndEnqueueLatestFrame(background_removal_filter *tf, obs_sour
 		currentEpoch = tf->modelEpoch.load(std::memory_order_acquire);
 	}
 
+	bool capturedGpu = false;
 	bool capturedCpu = false;
 	bool capturedIsBgra = false;
 
-	const enum gs_color_format texFmt = gs_texture_get_color_format(inferTex);
-	const uint32_t texW = gs_texture_get_width(inferTex);
-	const uint32_t texH = gs_texture_get_height(inferTex);
-	if ((texFmt == GS_RGBA || texFmt == GS_BGRA) && texW == netW && texH == netH) {
-		if (tf->inferStagesurface) {
-			const uint32_t sw = gs_stagesurface_get_width(tf->inferStagesurface);
-			const uint32_t sh = gs_stagesurface_get_height(tf->inferStagesurface);
-			const enum gs_color_format sfmt = gs_stagesurface_get_color_format(tf->inferStagesurface);
-			if (sw != netW || sh != netH || sfmt != texFmt) {
-				gs_stagesurface_destroy(tf->inferStagesurface);
-				tf->inferStagesurface = nullptr;
+	if (tf->cudaGpuReady.load(std::memory_order_acquire) && !tf->cudaPipeline.isGlInteropDisabled()) {
+		const auto capStatus = tf->cudaPipeline.captureGlTextureToSlotOnGraphicsThread(inferTex, writeSlot);
+		if (capStatus == CudaGpuPipeline::GlInteropStatus::Ok) {
+			capturedGpu = true;
+		} else if (capStatus == CudaGpuPipeline::GlInteropStatus::FallbackOwnershipPinned) {
+			// Quarantine inferTexrender while CUDA still holds its GL texture; render into a fresh target before staging.
+			tf->pinnedInferTexrenders.push_back(tf->inferTexrender);
+			tf->inferTexrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+			inferTex = nullptr;
+			if (tf->inferTexrender && renderTargetIntoTexrender(target, tf->inferTexrender, netW, netH)) {
+				inferTex = gs_texrender_get_texture(tf->inferTexrender);
 			}
 		}
-		if (!tf->inferStagesurface) {
-			tf->inferStagesurface = gs_stagesurface_create(netW, netH, texFmt);
-		}
-		if (tf->inferStagesurface && gs_stagesurface_get_width(tf->inferStagesurface) == texW &&
-		    gs_stagesurface_get_height(tf->inferStagesurface) == texH &&
-		    gs_stagesurface_get_color_format(tf->inferStagesurface) == texFmt) {
-			gs_stage_texture(tf->inferStagesurface, inferTex);
-			uint8_t *videoData = nullptr;
-			uint32_t linesize = 0;
-			if (gs_stagesurface_map(tf->inferStagesurface, &videoData, &linesize)) {
-				cv::Mat wrapped(static_cast<int>(netH), static_cast<int>(netW), CV_8UC4, videoData,
-						linesize);
-				wrapped.copyTo(tf->cpuInputSlots[static_cast<size_t>(writeSlot)]);
-				gs_stagesurface_unmap(tf->inferStagesurface);
-				capturedCpu = true;
-				capturedIsBgra = (texFmt == GS_BGRA);
+	}
+
+	if (!capturedGpu && inferTex != nullptr) {
+		// Labeled fallback path: stage pre-downscaled (netW x netH) texture with matching gs_color_format.
+		const enum gs_color_format texFmt = gs_texture_get_color_format(inferTex);
+		const uint32_t texW = gs_texture_get_width(inferTex);
+		const uint32_t texH = gs_texture_get_height(inferTex);
+		if ((texFmt == GS_RGBA || texFmt == GS_BGRA) && texW == netW && texH == netH) {
+			if (tf->inferStagesurface) {
+				const uint32_t sw = gs_stagesurface_get_width(tf->inferStagesurface);
+				const uint32_t sh = gs_stagesurface_get_height(tf->inferStagesurface);
+				const enum gs_color_format sfmt =
+					gs_stagesurface_get_color_format(tf->inferStagesurface);
+				if (sw != netW || sh != netH || sfmt != texFmt) {
+					gs_stagesurface_destroy(tf->inferStagesurface);
+					tf->inferStagesurface = nullptr;
+				}
+			}
+			if (!tf->inferStagesurface) {
+				tf->inferStagesurface = gs_stagesurface_create(netW, netH, texFmt);
+			}
+			if (tf->inferStagesurface && gs_stagesurface_get_width(tf->inferStagesurface) == texW &&
+			    gs_stagesurface_get_height(tf->inferStagesurface) == texH &&
+			    gs_stagesurface_get_color_format(tf->inferStagesurface) == texFmt) {
+				gs_stage_texture(tf->inferStagesurface, inferTex);
+				uint8_t *videoData = nullptr;
+				uint32_t linesize = 0;
+				if (gs_stagesurface_map(tf->inferStagesurface, &videoData, &linesize)) {
+					cv::Mat wrapped(static_cast<int>(netH), static_cast<int>(netW), CV_8UC4,
+							videoData, linesize);
+					wrapped.copyTo(tf->cpuInputSlots[static_cast<size_t>(writeSlot)]);
+					gs_stagesurface_unmap(tf->inferStagesurface);
+					capturedCpu = true;
+					capturedIsBgra = (texFmt == GS_BGRA);
+				}
 			}
 		}
 	}
@@ -1110,12 +1302,13 @@ static void captureAndEnqueueLatestFrame(background_removal_filter *tf, obs_sour
 	{
 		std::lock_guard<std::mutex> wlock(tf->workerMutex);
 		tf->renderSlot = -1;
-		if (capturedCpu && currentEpoch == tf->modelEpoch.load(std::memory_order_acquire) &&
+		if ((capturedGpu || capturedCpu) && currentEpoch == tf->modelEpoch.load(std::memory_order_acquire) &&
 		    !tf->stopWorker.load(std::memory_order_acquire)) {
 			if (tf->latestSlot != -1) {
 				tf->droppedByLatest++;
 			}
 			FrameSlotMeta &meta = tf->slotMeta[static_cast<size_t>(writeSlot)];
+			meta.isGpuSlot = capturedGpu;
 			meta.isBgra = capturedIsBgra;
 			meta.sourceW = sourceW;
 			meta.sourceH = sourceH;
@@ -1188,17 +1381,68 @@ static gs_texture_t *blur_background(std::shared_ptr<background_removal_filter> 
 static bool ensurePersistentAlphaTexture(background_removal_filter *tf)
 {
 	std::lock_guard<std::mutex> lock(tf->outputLock);
-	if (tf->publishedMaskGen == 0 || tf->backgroundMask.empty()) {
+	if (tf->publishedMaskGen == 0) {
 		return false;
 	}
 
+	if (tf->publishedMaskIsGpu && !tf->forceHostMaskUpload.load(std::memory_order_relaxed)) {
+		const uint32_t mw = tf->publishedMaskW;
+		const uint32_t mh = tf->publishedMaskH;
+		if (mw == 0 || mh == 0) {
+			return false;
+		}
+		if (!tf->alphaTexture || tf->alphaTexW != mw || tf->alphaTexH != mh || tf->alphaTexDynamic) {
+			releaseAlphaGlAndDestroyOnGraphicsThread(tf);
+			tf->alphaTexture = gs_texture_create(mw, mh, GS_R8, 1, nullptr, 0);
+			if (!tf->alphaTexture) {
+				return false;
+			}
+			tf->alphaTexW = mw;
+			tf->alphaTexH = mh;
+			tf->alphaTexDynamic = false;
+		}
+		if (tf->uploadedMaskGen != tf->publishedMaskGen) {
+			const auto upStatus = tf->cudaPipeline.uploadMaskToGlTextureOnGraphicsThread(tf->alphaTexture);
+			if (upStatus == CudaGpuPipeline::GlInteropStatus::Ok) {
+				tf->uploadedMaskGen = tf->publishedMaskGen;
+				return true;
+			}
+			if (upStatus == CudaGpuPipeline::GlInteropStatus::FallbackOwnershipPinned) {
+				// Quarantine CUDA-owned alphaTexture without calling gs_texture_destroy.
+				tf->pinnedAlphaTextures.push_back(tf->alphaTexture);
+				tf->alphaTexture = nullptr;
+				tf->alphaTexW = 0;
+				tf->alphaTexH = 0;
+				tf->alphaTexDynamic = false;
+				tf->uploadedMaskGen = 0;
+			} else {
+				releaseAlphaGlAndDestroyOnGraphicsThread(tf);
+			}
+			// Seamless fallback if GL_R8 interop is declined on this driver/backend
+			if (!tf->loggedGlR8Fallback) {
+				tf->loggedGlR8Fallback = true;
+				obs_log(LOG_WARNING,
+					"GL R8 mask interop unavailable; falling back to persistent GS_DYNAMIC mask upload");
+			}
+			tf->forceHostMaskUpload.store(true, std::memory_order_relaxed);
+			tf->backgroundMask.create(static_cast<int>(mh), static_cast<int>(mw), CV_8UC1);
+			if (!tf->cudaPipeline.downloadPublishedMaskToHost(tf->backgroundMask.data)) {
+				return false;
+			}
+			tf->publishedMaskIsGpu = false;
+		} else {
+			return true;
+		}
+	}
+
+	// Host-backed persistent GS_DYNAMIC upload (only re-uploads when publishedMaskGen advances)
+	if (tf->backgroundMask.empty()) {
+		return false;
+	}
 	const uint32_t mw = static_cast<uint32_t>(tf->backgroundMask.cols);
 	const uint32_t mh = static_cast<uint32_t>(tf->backgroundMask.rows);
-	if (!tf->alphaTexture || tf->alphaTexW != mw || tf->alphaTexH != mh) {
-		if (tf->alphaTexture) {
-			gs_texture_destroy(tf->alphaTexture);
-			tf->alphaTexture = nullptr;
-		}
+	if (!tf->alphaTexture || tf->alphaTexW != mw || tf->alphaTexH != mh || !tf->alphaTexDynamic) {
+		releaseAlphaGlAndDestroyOnGraphicsThread(tf);
 		tf->alphaTexture = gs_texture_create(mw, mh, GS_R8, 1, nullptr, GS_DYNAMIC);
 		if (!tf->alphaTexture) {
 			obs_log(LOG_ERROR, "Failed to create persistent GS_DYNAMIC alpha texture");
@@ -1206,7 +1450,7 @@ static bool ensurePersistentAlphaTexture(background_removal_filter *tf)
 		}
 		tf->alphaTexW = mw;
 		tf->alphaTexH = mh;
-		tf->uploadedMaskGen = 0;
+		tf->alphaTexDynamic = true;
 	}
 	if (tf->uploadedMaskGen != tf->publishedMaskGen) {
 		gs_texture_set_image(tf->alphaTexture, tf->backgroundMask.data,
@@ -1249,7 +1493,7 @@ void background_filter_video_render(void *data, gs_effect_t *_effect)
 		return;
 	}
 
-	// Capture latest downscaled frame to staged ring buffer & wake worker without blocking render.
+	// Capture latest downscaled frame to GPU/staged ring buffer & wake worker without blocking render.
 	captureAndEnqueueLatestFrame(tf.get(), target, width, height);
 
 	// Update persistent alphaTexture only when a newer mask has been published by the worker.
