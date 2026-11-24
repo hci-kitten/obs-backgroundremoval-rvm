@@ -11,6 +11,7 @@ set(PLUGIN_EMAIL "roy.shil@gmail.com" CACHE STRING "Author email of plugin")
 set(PLUGIN_BUILD_NUMBER "1" CACHE STRING "Build number in plugin metadata")
 set(PLUGIN_BUNDLE_ID "com.royshilkrot.obs-backgroundremoval" CACHE STRING "Bundle ID of plugin installer")
 set(PACKAGE_VERSION_SUFFIX "" CACHE STRING "Version suffix for plugin package")
+option(ENABLE_CUDA_EP "Enable ONNX Runtime CUDA Execution Provider on Linux" ON)
 
 ### Project
 block(PROPAGATE PLUGIN_VERSION)
@@ -185,6 +186,9 @@ if(MSVC)
   target_compile_options(obs-backgroundremoval_options INTERFACE /W4 /WX)
 elseif(APPLE OR OS_LINUX)
   target_compile_definitions(obs-backgroundremoval_options INTERFACE SIMDE_ENABLE_OPENMP)
+  if(OS_LINUX AND ENABLE_CUDA_EP)
+    target_compile_definitions(obs-backgroundremoval_options INTERFACE HAVE_ONNXRUNTIME_CUDA_EP)
+  endif()
   target_compile_options(obs-backgroundremoval_options INTERFACE -fopenmp-simd -Wall -Wextra -Werror)
 endif()
 

@@ -25,6 +25,8 @@
 
 int createOrtSession(filter_data *tf, const std::string &resolvedModelPath)
 {
+	tf->cudaSessionActive = false;
+
 	if (tf->model.get() == nullptr) {
 		obs_log(LOG_ERROR, "Model object is not initialized");
 		return OBS_BGREMOVAL_ORT_SESSION_ERROR_INVALID_MODEL;
@@ -60,7 +62,25 @@ int createOrtSession(filter_data *tf, const std::string &resolvedModelPath)
 	try {
 #ifdef HAVE_ONNXRUNTIME_CUDA_EP
 		if (tf->useGPU == USEGPU_CUDA) {
-			Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_CUDA(sessionOptions, 0));
+			// Skip CUDA EP for ORT-format (.ort) models to avoid provider incompatibilities;
+			// plain .onnx models use CUDA EP when available and fall back cleanly to CPU otherwise.
+			const std::string mp(tf->modelFilepath.begin(), tf->modelFilepath.end());
+			if (mp.size() >= 4 && mp.compare(mp.size() - 4, 4, ".ort") == 0) {
+				obs_log(LOG_WARNING, "Skipping CUDA EP for ORT-format model %s; running on CPU",
+					mp.c_str());
+			} else {
+				try {
+					OrtCUDAProviderOptions cudaOptions{};
+					cudaOptions.device_id = 0;
+					sessionOptions.AppendExecutionProvider_CUDA(cudaOptions);
+					tf->cudaSessionActive = true;
+				} catch (const Ort::Exception &e) {
+					obs_log(LOG_WARNING,
+						"CUDA Execution Provider unavailable (%s); falling back to CPU",
+						e.what());
+					tf->cudaSessionActive = false;
+				}
+			}
 		}
 #endif
 #ifdef HAVE_ONNXRUNTIME_ROCM_EP
@@ -86,7 +106,22 @@ int createOrtSession(filter_data *tf, const std::string &resolvedModelPath)
 				OrtSessionOptionsAppendExecutionProvider_CoreML(sessionOptions, coreml_flags));
 		}
 #endif
-		tf->session.reset(new Ort::Session(*tf->env, tf->modelFilepath.c_str(), sessionOptions));
+		if (tf->cudaSessionActive) {
+			try {
+				tf->session.reset(new Ort::Session(*tf->env, tf->modelFilepath.c_str(), sessionOptions));
+			} catch (const Ort::Exception &e) {
+				obs_log(LOG_WARNING,
+					"CUDA session initialization failed (%s); falling back to CPU", e.what());
+				tf->cudaSessionActive = false;
+				Ort::SessionOptions cpuOptions;
+				cpuOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+				cpuOptions.SetInterOpNumThreads(tf->numThreads);
+				cpuOptions.SetIntraOpNumThreads(tf->numThreads);
+				tf->session.reset(new Ort::Session(*tf->env, tf->modelFilepath.c_str(), cpuOptions));
+			}
+		} else {
+			tf->session.reset(new Ort::Session(*tf->env, tf->modelFilepath.c_str(), sessionOptions));
+		}
 	} catch (const std::exception &e) {
 		obs_log(LOG_ERROR, "%s", e.what());
 		return OBS_BGREMOVAL_ORT_SESSION_ERROR_STARTUP;

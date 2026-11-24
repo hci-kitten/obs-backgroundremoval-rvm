@@ -19,6 +19,7 @@ struct ORTModelData {
 	std::vector<std::vector<int64_t>> outputDims;
 	std::vector<std::vector<float>> outputTensorValues;
 	std::vector<std::vector<float>> inputTensorValues;
+	bool cudaSessionActive = false;
 };
 
 #endif /* ORTMODELDATA_H */
