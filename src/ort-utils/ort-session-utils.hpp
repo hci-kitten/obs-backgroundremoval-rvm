@@ -20,6 +20,6 @@
 
 int createOrtSession(filter_data *tf, const std::string &resolvedModelPath = {});
 
-bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat &output);
+bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat &output, bool inputIsRGBA = false);
 
 #endif /* ORT_SESSION_UTILS_H */

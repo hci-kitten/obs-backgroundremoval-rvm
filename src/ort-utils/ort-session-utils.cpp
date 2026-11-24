@@ -158,7 +158,7 @@ int createOrtSession(filter_data *tf, const std::string &resolvedModelPath)
 	return OBS_BGREMOVAL_ORT_SESSION_SUCCESS;
 }
 
-bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat &output)
+bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat &output, bool inputIsRGBA)
 {
 	if (tf->session.get() == nullptr) {
 		// Onnx runtime session is not initialized. Problem in initialization
@@ -171,14 +171,18 @@ bool runFilterModelInference(filter_data *tf, const cv::Mat &imageBGRA, cv::Mat 
 
 	// To RGB
 	cv::Mat imageRGB;
-	cv::cvtColor(imageBGRA, imageRGB, cv::COLOR_BGRA2RGB);
+	cv::cvtColor(imageBGRA, imageRGB, inputIsRGBA ? cv::COLOR_RGBA2RGB : cv::COLOR_BGRA2RGB);
 
 	// Resize to network input size
 	uint32_t inputWidth, inputHeight;
 	tf->model->getNetworkInputSize(tf->inputDims, inputWidth, inputHeight);
 
 	cv::Mat resizedImageRGB;
-	cv::resize(imageRGB, resizedImageRGB, cv::Size(inputWidth, inputHeight));
+	if (static_cast<uint32_t>(imageRGB.cols) == inputWidth && static_cast<uint32_t>(imageRGB.rows) == inputHeight) {
+		resizedImageRGB = imageRGB;
+	} else {
+		cv::resize(imageRGB, resizedImageRGB, cv::Size(inputWidth, inputHeight));
+	}
 
 	// Prepare input to nework
 	cv::Mat resizedImage, preprocessedImage;
